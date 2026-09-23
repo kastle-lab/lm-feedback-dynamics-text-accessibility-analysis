@@ -1,0 +1,5 @@
+nltk==3.9.1
+numpy==2.3.1
+scipy==1.16.0
+spacy==3.8.4
+syllapy==0.7.2
