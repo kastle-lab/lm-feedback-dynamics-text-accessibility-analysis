@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-"""Summarize per-model CSV logs from the Ollama experiment."""
+# Summarize per-model CSV logs from the Ollama experiment
 
 import argparse
 import ast
@@ -110,7 +109,3 @@ def main():
         if summary
     ]
     write_summary(results_dir / "summary.csv", summaries)
-
-
-if __name__ == "__main__":
-    main()

@@ -1,10 +1,4 @@
-#!/usr/bin/env python3
-"""Measure inter-rater agreement on overlapping annotation split workbooks.
-
-The split files are treated as rater-specific workbooks. Rows that appear in
-more than one workbook are overlap items. Ratings must be integers from 1 to 5.
-"""
-
+# Measure inter-rater agreement on overlapping annotation split workbooks. The split files are treated as rater-specific workbooks. Rows that appear in more than one workbook are overlap items. Ratings must be integers from 1 to 5.
 from __future__ import annotations
 
 import argparse
@@ -77,6 +71,8 @@ def parse_rating(value: object) -> int | None:
 def safe_text(value: object, max_chars: int = 160) -> str:
     if value is None:
         return ""
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
     text = re.sub(r"\s+", " ", str(value)).strip()
     return text[:max_chars]
 
@@ -247,16 +243,105 @@ def agreement_metrics(pairs: list[tuple[int, int]], min_rating: int, max_rating:
     }
 
 
+def normalized_metadata_value(value: object) -> object:
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return value
+
+
+def metadata_group_key(record: RatingRecord) -> tuple[object, object, object, object]:
+    return (
+        normalized_metadata_value(record.metadata.get("chapter_id")),
+        record.metadata.get("chapter_key"),
+        record.metadata.get("model"),
+        record.metadata.get("method"),
+    )
+
+
+def iteration_stage(record: RatingRecord, final_iteration_by_group: dict[tuple[object, object, object, object], int]) -> str:
+    iteration = normalized_metadata_value(record.metadata.get("iteration"))
+    if iteration == 1:
+        return "First"
+    if isinstance(iteration, int) and iteration == final_iteration_by_group.get(metadata_group_key(record)):
+        return "Final"
+    return "Intermediate"
+
+
+def add_grouped_agreement_rows(
+    rows: list[list[object]],
+    group_type: str,
+    group_value: str,
+    grouped_pairs: list[tuple[RatingRecord, RatingRecord]],
+    rubrics: list[str],
+) -> None:
+    all_cell_pairs = []
+    for rubric in rubrics:
+        score_pairs = [
+            (left.values[rubric], right.values[rubric])
+            for left, right in grouped_pairs
+            if left.values[rubric] is not None and right.values[rubric] is not None
+        ]
+        all_cell_pairs.extend(score_pairs)
+        metrics = agreement_metrics(score_pairs, 1, 5)
+        rows.append(
+            [
+                group_type,
+                group_value,
+                rubric,
+                metrics["paired_scores"],
+                metrics["exact_agreement_pct"],
+                metrics["mean_abs_difference"],
+                metrics["quadratic_weighted_kappa"],
+            ]
+        )
+
+    metrics = agreement_metrics(all_cell_pairs, 1, 5)
+    rows.append(
+        [
+            group_type,
+            group_value,
+            "All rubric cells",
+            metrics["paired_scores"],
+            metrics["exact_agreement_pct"],
+            metrics["mean_abs_difference"],
+            metrics["quadratic_weighted_kappa"],
+        ]
+    )
+
+
 def summarize(
     records: list[RatingRecord],
     pairs: list[tuple[RatingRecord, RatingRecord]],
     rubrics: list[str],
-) -> tuple[list[list[object]], list[list[object]], list[list[object]], list[list[object]], list[list[object]]]:
+) -> tuple[
+    list[list[object]],
+    list[list[object]],
+    list[list[object]],
+    list[list[object]],
+    list[list[object]],
+    list[list[object]],
+    list[list[object]],
+    list[list[object]],
+    list[list[object]],
+    list[list[object]],
+]:
     summary_rows: list[list[object]] = []
     pair_summary_rows: list[list[object]] = []
     alignment_rows: list[list[object]] = []
     mode_rows: list[list[object]] = []
     detail_rows: list[list[object]] = []
+    agreement_by_method_rows: list[list[object]] = []
+    agreement_by_iteration_rows: list[list[object]] = []
+    agreement_by_stage_rows: list[list[object]] = []
+    rating_distribution_rows: list[list[object]] = []
+    consensus_preference_rows: list[list[object]] = []
+
+    final_iteration_by_group: dict[tuple[object, object, object, object], int] = {}
+    for record in records:
+        iteration = normalized_metadata_value(record.metadata.get("iteration"))
+        if isinstance(iteration, int):
+            key = metadata_group_key(record)
+            final_iteration_by_group[key] = max(iteration, final_iteration_by_group.get(key, iteration))
 
     def add_summary_row(scope: str, rubric: str, score_pairs: list[tuple[int, int]], min_rating: int, max_rating: int):
         metrics = agreement_metrics(score_pairs, min_rating, max_rating)
@@ -310,6 +395,7 @@ def summarize(
                 left.metadata.get("model"),
                 left.metadata.get("method"),
                 left.metadata.get("iteration"),
+                iteration_stage(left, final_iteration_by_group),
                 comparable_count,
                 exact_count,
                 exact_count / comparable_count if comparable_count else None,
@@ -363,6 +449,7 @@ def summarize(
                     first.metadata.get("model"),
                     first.metadata.get("method"),
                     first.metadata.get("iteration"),
+                    iteration_stage(first, final_iteration_by_group),
                     rubric,
                     len(values),
                     ",".join(str(value) for value in values),
@@ -411,6 +498,7 @@ def summarize(
             left.metadata.get("model"),
             left.metadata.get("method"),
             left.metadata.get("iteration"),
+            iteration_stage(left, final_iteration_by_group),
         ]
         for rubric in rubrics:
             left_value = left.values[rubric]
@@ -426,7 +514,121 @@ def summarize(
             )
         detail_rows.append(row)
 
-    return summary_rows, pair_summary_rows, alignment_rows, mode_rows, detail_rows
+    by_method: dict[str, list[tuple[RatingRecord, RatingRecord]]] = defaultdict(list)
+    by_iteration: dict[str, list[tuple[RatingRecord, RatingRecord]]] = defaultdict(list)
+    by_stage: dict[str, list[tuple[RatingRecord, RatingRecord]]] = defaultdict(list)
+    by_method_stage: dict[str, list[tuple[RatingRecord, RatingRecord]]] = defaultdict(list)
+    for left, right in pairs:
+        method = str(left.metadata.get("method") or "")
+        iteration = str(normalized_metadata_value(left.metadata.get("iteration")) or "")
+        stage = iteration_stage(left, final_iteration_by_group)
+        by_method[method].append((left, right))
+        by_iteration[iteration].append((left, right))
+        by_stage[stage].append((left, right))
+        by_method_stage[f"{method} | {stage}"].append((left, right))
+
+    for method, grouped_pairs in sorted(by_method.items()):
+        add_grouped_agreement_rows(agreement_by_method_rows, "method", method, grouped_pairs, rubrics)
+    for iteration, grouped_pairs in sorted(by_iteration.items(), key=lambda item: int(item[0]) if item[0].isdigit() else 999):
+        add_grouped_agreement_rows(agreement_by_iteration_rows, "iteration", iteration, grouped_pairs, rubrics)
+    for stage in ["First", "Intermediate", "Final"]:
+        if stage in by_stage:
+            add_grouped_agreement_rows(agreement_by_stage_rows, "iteration_stage", stage, by_stage[stage], rubrics)
+    for group_value, grouped_pairs in sorted(by_method_stage.items()):
+        add_grouped_agreement_rows(agreement_by_stage_rows, "method_iteration_stage", group_value, grouped_pairs, rubrics)
+
+    overlap_keys = {left.row_key for left, _right in pairs} | {right.row_key for _left, right in pairs}
+    overlap_records = [record for record in records if record.row_key in overlap_keys]
+
+    def add_distribution_row(scope_type: str, scope_value: str, rubric: str, values: list[int]) -> None:
+        counts = Counter(values)
+        total = sum(counts.values())
+        row = [scope_type, scope_value, rubric, total]
+        row.extend(counts.get(score, 0) for score in range(1, 6))
+        row.extend((counts.get(score, 0) / total if total else None) for score in range(1, 6))
+        row.extend(
+            [
+                (counts.get(1, 0) + counts.get(2, 0)) / total if total else None,
+                counts.get(3, 0) / total if total else None,
+                (counts.get(4, 0) + counts.get(5, 0)) / total if total else None,
+            ]
+        )
+        rating_distribution_rows.append(row)
+
+    distribution_groups: dict[tuple[str, str], list[RatingRecord]] = defaultdict(list)
+    distribution_groups[("all_overlap", "All overlap ratings")] = overlap_records
+    for record in overlap_records:
+        method = str(record.metadata.get("method") or "")
+        iteration = str(normalized_metadata_value(record.metadata.get("iteration")) or "")
+        stage = iteration_stage(record, final_iteration_by_group)
+        distribution_groups[("method", method)].append(record)
+        distribution_groups[("iteration", iteration)].append(record)
+        distribution_groups[("iteration_stage", stage)].append(record)
+        distribution_groups[("method_iteration_stage", f"{method} | {stage}")].append(record)
+
+    for (scope_type, scope_value), grouped_records in sorted(distribution_groups.items()):
+        for rubric in rubrics:
+            values = [record.values[rubric] for record in grouped_records if record.values[rubric] is not None]
+            add_distribution_row(scope_type, scope_value, rubric, values)
+
+    mode_distribution_groups: dict[tuple[str, str], list[list[object]]] = defaultdict(list)
+    for row in mode_rows:
+        method = str(row[3] or "")
+        iteration = str(normalized_metadata_value(row[4]) or "")
+        stage = str(row[5] or "")
+        mode_distribution_groups[("all_overlap", "All consensus rows")].append(row)
+        mode_distribution_groups[("method", method)].append(row)
+        mode_distribution_groups[("iteration", iteration)].append(row)
+        mode_distribution_groups[("iteration_stage", stage)].append(row)
+        mode_distribution_groups[("method_iteration_stage", f"{method} | {stage}")].append(row)
+
+    for (scope_type, scope_value), grouped_rows in sorted(mode_distribution_groups.items()):
+        for rubric in rubrics:
+            rubric_rows = [row for row in grouped_rows if row[6] == rubric]
+            value_weights = Counter()
+            tie_count = 0
+            disagreed_count = 0
+            for row in rubric_rows:
+                modes = [int(value) for value in str(row[9]).split(",") if value]
+                if len(modes) > 1:
+                    tie_count += 1
+                if row[11]:
+                    disagreed_count += 1
+                for value in modes:
+                    value_weights[value] += 1 / len(modes)
+            total = len(rubric_rows)
+            preference_total = sum(value_weights.values())
+            preference_values = [value_weights.get(score, 0) for score in range(1, 6)]
+            consensus_preference_rows.append(
+                [
+                    scope_type,
+                    scope_value,
+                    rubric,
+                    total,
+                    disagreed_count,
+                    disagreed_count / total if total else None,
+                    tie_count,
+                    tie_count / total if total else None,
+                    *preference_values,
+                    *[
+                        value / preference_total if preference_total else None
+                        for value in preference_values
+                    ],
+                ]
+            )
+
+    return (
+        summary_rows,
+        pair_summary_rows,
+        alignment_rows,
+        mode_rows,
+        detail_rows,
+        agreement_by_method_rows,
+        agreement_by_iteration_rows,
+        agreement_by_stage_rows,
+        rating_distribution_rows,
+        consensus_preference_rows,
+    )
 
 
 def write_rows(ws, headers: list[str], rows: Iterable[list[object]]) -> None:
@@ -479,6 +681,11 @@ def create_report(
     alignment_rows: list[list[object]],
     mode_rows: list[list[object]],
     detail_rows: list[list[object]],
+    agreement_by_method_rows: list[list[object]],
+    agreement_by_iteration_rows: list[list[object]],
+    agreement_by_stage_rows: list[list[object]],
+    rating_distribution_rows: list[list[object]],
+    consensus_preference_rows: list[list[object]],
     validation_rows: list[list[object]],
     rubrics: list[str],
 ) -> None:
@@ -486,6 +693,11 @@ def create_report(
     summary = workbook.active
     summary.title = "Agreement Summary"
     rater_pairs = workbook.create_sheet("Rater Pair Summary")
+    by_method = workbook.create_sheet("Agreement by Method")
+    by_iteration = workbook.create_sheet("Agreement by Iteration")
+    by_stage = workbook.create_sheet("Agreement by Stage")
+    distributions = workbook.create_sheet("Rating Distributions")
+    consensus = workbook.create_sheet("Consensus Preferences")
     alignment = workbook.create_sheet("Overall Alignment")
     modes = workbook.create_sheet("Rubric Modes")
     details = workbook.create_sheet("Overlap Details")
@@ -516,6 +728,59 @@ def create_report(
         ],
         pair_summary_rows,
     )
+    grouped_agreement_headers = [
+        "group_type",
+        "group_value",
+        "rubric",
+        "paired_scores",
+        "exact_agreement_pct",
+        "mean_abs_difference",
+        "quadratic_weighted_kappa",
+    ]
+    write_rows(by_method, grouped_agreement_headers, agreement_by_method_rows)
+    write_rows(by_iteration, grouped_agreement_headers, agreement_by_iteration_rows)
+    write_rows(by_stage, grouped_agreement_headers, agreement_by_stage_rows)
+    distribution_headers = [
+        "scope_type",
+        "scope_value",
+        "rubric",
+        "rating_count",
+        "rating_1_count",
+        "rating_2_count",
+        "rating_3_count",
+        "rating_4_count",
+        "rating_5_count",
+        "rating_1_pct",
+        "rating_2_pct",
+        "rating_3_pct",
+        "rating_4_pct",
+        "rating_5_pct",
+        "ratings_1_2_pct",
+        "rating_3_pct_mid",
+        "ratings_4_5_pct",
+    ]
+    write_rows(distributions, distribution_headers, rating_distribution_rows)
+    consensus_headers = [
+        "scope_type",
+        "scope_value",
+        "rubric",
+        "consensus_rows",
+        "disagreed_rows",
+        "disagreed_pct",
+        "tied_mode_rows",
+        "tied_mode_pct",
+        "mode_1_weighted_count",
+        "mode_2_weighted_count",
+        "mode_3_weighted_count",
+        "mode_4_weighted_count",
+        "mode_5_weighted_count",
+        "mode_1_pct",
+        "mode_2_pct",
+        "mode_3_pct",
+        "mode_4_pct",
+        "mode_5_pct",
+    ]
+    write_rows(consensus, consensus_headers, consensus_preference_rows)
     write_rows(
         alignment,
         [
@@ -526,6 +791,7 @@ def create_report(
             "model",
             "method",
             "iteration",
+            "iteration_stage",
             "comparable_rubric_cells",
             "exact_rubric_cells",
             "exact_rubric_cell_pct",
@@ -543,6 +809,7 @@ def create_report(
             "model",
             "method",
             "iteration",
+            "iteration_stage",
             "rubric",
             "human_rating_count",
             "human_scores",
@@ -565,6 +832,7 @@ def create_report(
         "model",
         "method",
         "iteration",
+        "iteration_stage",
     ]
     for rubric in rubrics:
         safe_rubric = rubric.lower().replace(" ", "_")
@@ -584,6 +852,11 @@ def create_report(
 
     workbook["Agreement Summary"].sheet_properties.tabColor = "1F4E78"
     workbook["Rater Pair Summary"].sheet_properties.tabColor = "5B9BD5"
+    workbook["Agreement by Method"].sheet_properties.tabColor = "4472C4"
+    workbook["Agreement by Iteration"].sheet_properties.tabColor = "4472C4"
+    workbook["Agreement by Stage"].sheet_properties.tabColor = "4472C4"
+    workbook["Rating Distributions"].sheet_properties.tabColor = "A9D18E"
+    workbook["Consensus Preferences"].sheet_properties.tabColor = "A9D18E"
     workbook["Overall Alignment"].sheet_properties.tabColor = "70AD47"
     workbook["Rubric Modes"].sheet_properties.tabColor = "A9D18E"
     workbook["Overlap Details"].sheet_properties.tabColor = "70AD47"
@@ -650,7 +923,18 @@ def main() -> None:
         rater_regex=args.rater_regex,
     )
     pairs = pair_records(records)
-    summary_rows, pair_summary_rows, alignment_rows, mode_rows, detail_rows = summarize(records, pairs, args.rubrics)
+    (
+        summary_rows,
+        pair_summary_rows,
+        alignment_rows,
+        mode_rows,
+        detail_rows,
+        agreement_by_method_rows,
+        agreement_by_iteration_rows,
+        agreement_by_stage_rows,
+        rating_distribution_rows,
+        consensus_preference_rows,
+    ) = summarize(records, pairs, args.rubrics)
     create_report(
         args.output,
         summary_rows,
@@ -658,13 +942,14 @@ def main() -> None:
         alignment_rows,
         mode_rows,
         detail_rows,
+        agreement_by_method_rows,
+        agreement_by_iteration_rows,
+        agreement_by_stage_rows,
+        rating_distribution_rows,
+        consensus_preference_rows,
         validation_rows,
         args.rubrics,
     )
     print(f"Read {len(records)} annotated rows from {args.input_dir}")
     print(f"Found {len(pairs)} overlap item pairs")
     print(f"Wrote {args.output}")
-
-
-if __name__ == "__main__":
-    main()

@@ -1,11 +1,5 @@
-#!/usr/bin/env python3
-"""Compare LLM judge scores with combined human ratings on overlap rows.
-
-For each rewritten text with one or more human ratings, an LLM score is counted
-as correct when it matches any human score for the same rubric. This makes rows
-with human disagreement permissive: if humans gave 3 and 4, either 3 or 4 is
-treated as agreement.
-"""
+# Compare LLM judge scores with combined human ratings on overlap rows.
+# For each rewritten text with one or more human ratings, an LLM score is counted as correct when it matches any human score for the same rubric. This makes rows with human disagreement permissive: if humans gave 3 and 4, either 3 or 4 is treated as agreement.
 
 from __future__ import annotations
 
@@ -34,6 +28,7 @@ DEFAULT_RUBRICS = {
 
 @dataclass
 class HumanItem:
+    match_text_key: str
     ratings: dict[str, list[int]]
     rows: list[dict[str, object]]
 
@@ -52,6 +47,23 @@ def normalize_text(value: object) -> str:
 
 def text_key(value: object) -> str:
     return hashlib.sha1(normalize_text(value).encode("utf-8")).hexdigest()
+
+
+def stable_value(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return re.sub(r"\s+", " ", str(value).strip())
+
+
+def human_item_key(metadata: dict[str, object], rewritten_text: object) -> str:
+    parts = [
+        f"{name}={stable_value(metadata.get(name))}"
+        for name in ["chapter_id", "chapter_key", "model", "method", "iteration"]
+    ]
+    parts.append(f"rewritten_text={normalize_text(rewritten_text)}")
+    return hashlib.sha1("||".join(parts).encode("utf-8")).hexdigest()
 
 
 def parse_rating(value: object) -> int | None:
@@ -132,21 +144,24 @@ def read_human_items(
         for row_number, row in enumerate(rows, start=2):
             if not any(value is not None and str(value).strip() for value in row):
                 continue
-            key = text_key(row[rewritten_idx] if rewritten_idx < len(row) else "")
-            if not key:
+            rewritten_text = row[rewritten_idx] if rewritten_idx < len(row) else ""
+            match_key = text_key(rewritten_text)
+            metadata = {
+                name: row[idx] if idx is not None and idx < len(row) else None
+                for name, idx in metadata_indices.items()
+            }
+            key = human_item_key(metadata, rewritten_text)
+            if not match_key:
                 continue
             item = items.setdefault(
                 key,
-                HumanItem(ratings={rubric: [] for rubric in rubrics}, rows=[]),
+                HumanItem(match_text_key=match_key, ratings={rubric: [] for rubric in rubrics}, rows=[]),
             )
             item.rows.append(
                 {
                     "source_file": path.name,
                     "row_number": row_number,
-                    **{
-                        name: row[idx] if idx is not None and idx < len(row) else None
-                        for name, idx in metadata_indices.items()
-                    },
+                    **metadata,
                 }
             )
             for rubric, idx in rubric_indices.items():
@@ -207,9 +222,12 @@ def read_llm_predictions(
     human_items: dict[str, HumanItem],
     rubrics: dict[str, str],
 ) -> tuple[dict[str, dict[str, dict[str, int | None]]], list[list[object]], dict[str, dict[str, int]]]:
-    predictions_by_model: dict[str, dict[str, list[dict[str, int | None]]]] = defaultdict(lambda: defaultdict(list))
+    predictions_by_model_text: dict[str, dict[str, list[dict[str, int | None]]]] = defaultdict(lambda: defaultdict(list))
     validation_rows: list[list[object]] = []
     duplicate_stats: dict[str, dict[str, int]] = {}
+    human_keys_by_text: dict[str, list[str]] = defaultdict(list)
+    for human_key, human_item in human_items.items():
+        human_keys_by_text[human_item.match_text_key].append(human_key)
     files = sorted(judge_dir.glob(glob_pattern))
     if not files:
         raise FileNotFoundError(f"No judge JSONL files matched {judge_dir / glob_pattern}")
@@ -228,25 +246,26 @@ def read_llm_predictions(
                     continue
                 source_text = (record.get("source_row") or {}).get("text", "")
                 key = text_key(source_text)
-                if key not in human_items:
+                if key not in human_keys_by_text:
                     continue
                 scores = parse_judgment(record.get("judgment"), rubrics)
                 if scores is None:
                     validation_rows.append([path.name, model, line_number, "invalid_judgment", "Could not parse scores"])
                     scores = {rubric: None for rubric in rubrics}
-                predictions_by_model[model][key].append(scores)
+                predictions_by_model_text[model][key].append(scores)
 
     collapsed_by_model: dict[str, dict[str, dict[str, int | None]]] = {}
-    for model, predictions_by_key in predictions_by_model.items():
+    for model, predictions_by_text in predictions_by_model_text.items():
         collapsed_by_model[model] = {}
         duplicate_keys = 0
         conflicting_duplicate_metric_predictions = 0
-        for key, predictions in predictions_by_key.items():
+        for text_match_key, predictions in predictions_by_text.items():
             if len(predictions) > 1:
                 duplicate_keys += 1
             collapsed, conflicts = modal_prediction(predictions, rubrics)
             conflicting_duplicate_metric_predictions += conflicts
-            collapsed_by_model[model][key] = collapsed
+            for human_key in human_keys_by_text[text_match_key]:
+                collapsed_by_model[model][human_key] = collapsed
         duplicate_stats[model] = {
             "duplicate_overlap_items": duplicate_keys,
             "conflicting_duplicate_metric_predictions": conflicting_duplicate_metric_predictions,
@@ -298,14 +317,62 @@ def summarize(
     list[list[object]],
     list[list[object]],
     list[list[object]],
+    list[list[object]],
+    list[list[object]],
+    list[list[object]],
+    list[list[object]],
 ]:
     summary_rows: list[list[object]] = []
     metric_rows: list[list[object]] = []
     distribution_rows: list[list[object]] = []
     bias_rows: list[list[object]] = []
     group_rows: list[list[object]] = []
+    method_iteration_rows: list[list[object]] = []
+    agentic_delta_rows: list[list[object]] = []
+    judge_preference_rows: list[list[object]] = []
+    aligned_preference_rows: list[list[object]] = []
     confusion_rows: list[list[object]] = []
     detail_rows: list[list[object]] = []
+    method_iteration_counts: dict[tuple[str, str, str, str], Counter] = defaultdict(Counter)
+    judge_preference_counts: dict[tuple[str, str], Counter] = defaultdict(Counter)
+    overall_accuracy_by_model: dict[str, float | None] = {}
+
+    def add_score_stats(
+        counter: Counter,
+        prediction: int | None,
+        allowed: set[int],
+        exact: bool,
+        abs_diff: int | None,
+        disagreed: bool,
+    ) -> None:
+        counter["cells"] += 1
+        counter["exact"] += int(exact)
+        counter["invalid"] += int(prediction is None)
+        counter["scored"] += int(prediction is not None)
+        if abs_diff is not None:
+            counter["abs_diff_sum"] += abs_diff
+        counter["human_agreed_cells"] += int(not disagreed)
+        counter["human_agreed_exact"] += int((not disagreed) and exact)
+        counter["human_disagreed_cells"] += int(disagreed)
+        counter["human_disagreed_exact"] += int(disagreed and exact)
+        if prediction is not None:
+            counter[f"llm_score_{prediction}"] += 1
+        for human_score in allowed:
+            counter[f"human_allowed_{human_score}"] += 1
+        if not disagreed:
+            counter[f"human_agreed_score_{next(iter(allowed))}"] += 1
+
+    def exact_pct(counter: Counter) -> float | None:
+        return pct(counter["exact"], counter["cells"])
+
+    def mean_abs(counter: Counter) -> float | None:
+        return pct(counter["abs_diff_sum"], counter["scored"])
+
+    def iteration_sort_value(value: str) -> tuple[int, str]:
+        try:
+            return (int(float(value)), value)
+        except (TypeError, ValueError):
+            return (10**9, value)
 
     for model, predictions_by_key in sorted(predictions_by_model.items()):
         model_counts = Counter()
@@ -376,6 +443,29 @@ def summarize(
                 if abs_diff is not None:
                     group_counts[group_key]["scored"] += 1
                     group_counts[group_key]["abs_diff_sum"] += abs_diff
+                add_score_stats(
+                    method_iteration_counts[
+                        (
+                            model,
+                            str(first_row.get("method") or ""),
+                            str(first_row.get("iteration") or ""),
+                            rubric,
+                        )
+                    ],
+                    prediction,
+                    allowed,
+                    exact,
+                    abs_diff,
+                    disagreed,
+                )
+                add_score_stats(
+                    judge_preference_counts[(model, rubric)],
+                    prediction,
+                    allowed,
+                    exact,
+                    abs_diff,
+                    disagreed,
+                )
 
                 human_label = ",".join(str(value) for value in sorted(allowed))
                 llm_label = str(prediction) if prediction is not None else "invalid"
@@ -464,6 +554,7 @@ def summarize(
                 )
 
         cells = model_counts["cells"]
+        overall_accuracy_by_model[model] = pct(model_counts["exact"], cells)
         summary_rows.append(
             [
                 model,
@@ -523,6 +614,154 @@ def summarize(
         for (judge_model, rubric, human_scores, llm_label), count in sorted(confusion_counts.items()):
             confusion_rows.append([judge_model, rubric, human_scores, llm_label, count])
 
+    for (judge_model, method, iteration, rubric), counts in sorted(
+        method_iteration_counts.items(),
+        key=lambda item: (item[0][0], item[0][1], iteration_sort_value(item[0][2]), item[0][3]),
+    ):
+        row = [
+            judge_model,
+            method,
+            iteration,
+            rubric,
+            counts["cells"],
+            exact_pct(counts),
+            mean_abs(counts),
+            counts["human_agreed_cells"],
+            pct(counts["human_agreed_exact"], counts["human_agreed_cells"]),
+            counts["human_disagreed_cells"],
+            pct(counts["human_disagreed_exact"], counts["human_disagreed_cells"]),
+            counts["invalid"],
+        ]
+        for score in range(1, 6):
+            row.extend(
+                [
+                    counts.get(f"llm_score_{score}", 0),
+                    pct(counts.get(f"llm_score_{score}", 0), counts["cells"]),
+                ]
+            )
+        method_iteration_rows.append(row)
+
+    by_method = defaultdict(dict)
+    for key, counts in method_iteration_counts.items():
+        judge_model, method, iteration, rubric = key
+        by_method[(judge_model, method, rubric)][iteration] = counts
+    for (judge_model, method, rubric), by_iteration in sorted(by_method.items()):
+        ordered_iterations = sorted(by_iteration, key=iteration_sort_value)
+        if len(ordered_iterations) >= 2:
+            first_iteration = ordered_iterations[0]
+            final_iteration = ordered_iterations[-1]
+            first_counts = by_iteration[first_iteration]
+            final_counts = by_iteration[final_iteration]
+            agentic_delta_rows.append(
+                [
+                    "final_minus_first",
+                    judge_model,
+                    method,
+                    rubric,
+                    first_iteration,
+                    final_iteration,
+                    first_counts["cells"],
+                    final_counts["cells"],
+                    exact_pct(first_counts),
+                    exact_pct(final_counts),
+                    (exact_pct(final_counts) - exact_pct(first_counts))
+                    if exact_pct(final_counts) is not None and exact_pct(first_counts) is not None
+                    else None,
+                    mean_abs(first_counts),
+                    mean_abs(final_counts),
+                    (mean_abs(final_counts) - mean_abs(first_counts))
+                    if mean_abs(final_counts) is not None and mean_abs(first_counts) is not None
+                    else None,
+                ]
+            )
+
+    by_method_delta = defaultdict(dict)
+    for key, counts in method_iteration_counts.items():
+        judge_model, method, iteration, rubric = key
+        by_method_delta[(judge_model, iteration, rubric)][method] = counts
+    for (judge_model, iteration, rubric), by_method_name in sorted(
+        by_method_delta.items(), key=lambda item: (item[0][0], iteration_sort_value(item[0][1]), item[0][2])
+    ):
+        if "Holistic" in by_method_name and "Incremental" in by_method_name:
+            holistic = by_method_name["Holistic"]
+            incremental = by_method_name["Incremental"]
+            agentic_delta_rows.append(
+                [
+                    "incremental_minus_holistic",
+                    judge_model,
+                    f"iteration_{iteration}",
+                    rubric,
+                    "Holistic",
+                    "Incremental",
+                    holistic["cells"],
+                    incremental["cells"],
+                    exact_pct(holistic),
+                    exact_pct(incremental),
+                    (exact_pct(incremental) - exact_pct(holistic))
+                    if exact_pct(incremental) is not None and exact_pct(holistic) is not None
+                    else None,
+                    mean_abs(holistic),
+                    mean_abs(incremental),
+                    (mean_abs(incremental) - mean_abs(holistic))
+                    if mean_abs(incremental) is not None and mean_abs(holistic) is not None
+                    else None,
+                ]
+            )
+
+    for (judge_model, rubric), counts in sorted(judge_preference_counts.items()):
+        row = [
+            judge_model,
+            rubric,
+            overall_accuracy_by_model.get(judge_model),
+            counts["cells"],
+            exact_pct(counts),
+            mean_abs(counts),
+            counts["human_agreed_cells"],
+            pct(counts["human_agreed_exact"], counts["human_agreed_cells"]),
+            counts["human_disagreed_cells"],
+            pct(counts["human_disagreed_exact"], counts["human_disagreed_cells"]),
+        ]
+        for score in range(1, 6):
+            row.extend(
+                [
+                    counts.get(f"llm_score_{score}", 0),
+                    pct(counts.get(f"llm_score_{score}", 0), counts["cells"]),
+                    counts.get(f"human_allowed_{score}", 0),
+                    pct(counts.get(f"human_allowed_{score}", 0), counts["cells"]),
+                    counts.get(f"human_agreed_score_{score}", 0),
+                    pct(counts.get(f"human_agreed_score_{score}", 0), counts["human_agreed_cells"]),
+                ]
+            )
+        judge_preference_rows.append(row)
+
+    ranked_models = [
+        model
+        for model, accuracy in sorted(
+            overall_accuracy_by_model.items(),
+            key=lambda item: (item[1] is not None, item[1] or -1),
+            reverse=True,
+        )
+    ]
+    top_models = set(ranked_models[:3])
+    preference_band_counts: dict[tuple[str, str], Counter] = defaultdict(Counter)
+    for (judge_model, rubric), counts in judge_preference_counts.items():
+        band = "top_3_alignment" if judge_model in top_models else "other_judges"
+        dest = preference_band_counts[(band, rubric)]
+        for key, value in counts.items():
+            dest[key] += value
+    for (band, rubric), counts in sorted(preference_band_counts.items()):
+        row = [band, rubric, counts["cells"], exact_pct(counts), mean_abs(counts)]
+        for score in range(1, 6):
+            row.extend(
+                [
+                    counts.get(f"llm_score_{score}", 0),
+                    pct(counts.get(f"llm_score_{score}", 0), counts["cells"]),
+                    counts.get(f"human_allowed_{score}", 0),
+                    pct(counts.get(f"human_allowed_{score}", 0), counts["cells"]),
+                ]
+            )
+        aligned_preference_rows.append(row)
+
     summary_rows.sort(key=lambda row: (row[3] is not None, row[3]), reverse=True)
     metric_rows.sort(key=lambda row: (row[0], row[1]))
     distribution_rows.sort(key=lambda row: (row[0], row[1], row[2]))
@@ -530,7 +769,19 @@ def summarize(
     group_rows.sort(key=lambda row: (row[0], row[1], row[2], row[3], row[4]))
     confusion_rows.sort(key=lambda row: (row[0], row[1], row[2], row[3]))
     detail_rows.sort(key=lambda row: (row[0], row[3] or "", row[8]))
-    return summary_rows, metric_rows, distribution_rows, bias_rows, group_rows, confusion_rows, detail_rows
+    return (
+        summary_rows,
+        metric_rows,
+        distribution_rows,
+        bias_rows,
+        group_rows,
+        method_iteration_rows,
+        agentic_delta_rows,
+        judge_preference_rows,
+        aligned_preference_rows,
+        confusion_rows,
+        detail_rows,
+    )
 
 
 def write_rows(ws, headers: list[str], rows: Iterable[list[object]]) -> None:
@@ -578,6 +829,10 @@ def create_report(
     distribution_rows: list[list[object]],
     bias_rows: list[list[object]],
     group_rows: list[list[object]],
+    method_iteration_rows: list[list[object]],
+    agentic_delta_rows: list[list[object]],
+    judge_preference_rows: list[list[object]],
+    aligned_preference_rows: list[list[object]],
     confusion_rows: list[list[object]],
     detail_rows: list[list[object]],
     validation_rows: list[list[object]],
@@ -589,6 +844,10 @@ def create_report(
     distributions = workbook.create_sheet("Score Distributions")
     bias = workbook.create_sheet("Score Direction")
     groups = workbook.create_sheet("By Generation Group")
+    method_iteration = workbook.create_sheet("Method Iteration Summary")
+    agentic_delta = workbook.create_sheet("Agentic Deltas")
+    judge_preferences = workbook.create_sheet("Judge Preferences")
+    aligned_preferences = workbook.create_sheet("Alignment Preference")
     confusion = workbook.create_sheet("Confusion Matrix")
     details = workbook.create_sheet("Overlap Details")
     validation = workbook.create_sheet("Validation Issues")
@@ -682,6 +941,83 @@ def create_report(
         ],
         group_rows,
     )
+    score_pair_headers = []
+    for score in range(1, 6):
+        score_pair_headers.extend([f"llm_score_{score}_count", f"llm_score_{score}_pct"])
+    write_rows(
+        method_iteration,
+        [
+            "judge_model",
+            "method",
+            "iteration",
+            "rubric",
+            "metric_cells",
+            "exact_accuracy_any_human",
+            "mean_abs_difference_to_allowed",
+            "human_agreed_cells",
+            "human_agreed_exact_accuracy",
+            "human_disagreed_cells",
+            "human_disagreed_exact_accuracy",
+            "invalid_score_cells",
+            *score_pair_headers,
+        ],
+        method_iteration_rows,
+    )
+    write_rows(
+        agentic_delta,
+        [
+            "comparison",
+            "judge_model",
+            "method_or_iteration",
+            "rubric",
+            "baseline_label",
+            "comparison_label",
+            "baseline_cells",
+            "comparison_cells",
+            "baseline_exact_accuracy",
+            "comparison_exact_accuracy",
+            "exact_accuracy_delta",
+            "baseline_mean_abs_difference",
+            "comparison_mean_abs_difference",
+            "mean_abs_difference_delta",
+        ],
+        agentic_delta_rows,
+    )
+    preference_headers = [
+        "judge_model",
+        "rubric",
+        "overall_exact_accuracy_any_human",
+        "metric_cells",
+        "exact_accuracy_any_human",
+        "mean_abs_difference_to_allowed",
+        "human_agreed_cells",
+        "human_agreed_exact_accuracy",
+        "human_disagreed_cells",
+        "human_disagreed_exact_accuracy",
+    ]
+    for score in range(1, 6):
+        preference_headers.extend(
+            [
+                f"llm_score_{score}_count",
+                f"llm_score_{score}_pct",
+                f"human_allowed_{score}_count",
+                f"human_allowed_{score}_pct",
+                f"human_agreed_{score}_count",
+                f"human_agreed_{score}_pct",
+            ]
+        )
+    write_rows(judge_preferences, preference_headers, judge_preference_rows)
+    aligned_headers = ["alignment_group", "rubric", "metric_cells", "exact_accuracy_any_human", "mean_abs_difference"]
+    for score in range(1, 6):
+        aligned_headers.extend(
+            [
+                f"llm_score_{score}_count",
+                f"llm_score_{score}_pct",
+                f"human_allowed_{score}_count",
+                f"human_allowed_{score}_pct",
+            ]
+        )
+    write_rows(aligned_preferences, aligned_headers, aligned_preference_rows)
     write_rows(
         confusion,
         [
@@ -725,6 +1061,10 @@ def create_report(
     workbook["Score Distributions"].sheet_properties.tabColor = "A9D18E"
     workbook["Score Direction"].sheet_properties.tabColor = "9E480E"
     workbook["By Generation Group"].sheet_properties.tabColor = "8064A2"
+    workbook["Method Iteration Summary"].sheet_properties.tabColor = "4BACC6"
+    workbook["Agentic Deltas"].sheet_properties.tabColor = "F79646"
+    workbook["Judge Preferences"].sheet_properties.tabColor = "92D050"
+    workbook["Alignment Preference"].sheet_properties.tabColor = "00B050"
     workbook["Confusion Matrix"].sheet_properties.tabColor = "C0504D"
     workbook["Overlap Details"].sheet_properties.tabColor = "70AD47"
     workbook["Validation Issues"].sheet_properties.tabColor = "FFC000"
@@ -778,7 +1118,19 @@ def main() -> None:
         human_items=human_items,
         rubrics=DEFAULT_RUBRICS,
     )
-    summary_rows, metric_rows, distribution_rows, bias_rows, group_rows, confusion_rows, detail_rows = summarize(
+    (
+        summary_rows,
+        metric_rows,
+        distribution_rows,
+        bias_rows,
+        group_rows,
+        method_iteration_rows,
+        agentic_delta_rows,
+        judge_preference_rows,
+        aligned_preference_rows,
+        confusion_rows,
+        detail_rows,
+    ) = summarize(
         human_items=human_items,
         predictions_by_model=predictions_by_model,
         duplicate_stats=duplicate_stats,
@@ -791,14 +1143,14 @@ def main() -> None:
         distribution_rows=distribution_rows,
         bias_rows=bias_rows,
         group_rows=group_rows,
+        method_iteration_rows=method_iteration_rows,
+        agentic_delta_rows=agentic_delta_rows,
+        judge_preference_rows=judge_preference_rows,
+        aligned_preference_rows=aligned_preference_rows,
         confusion_rows=confusion_rows,
         detail_rows=detail_rows,
         validation_rows=human_issues + judge_issues,
     )
-    print(f"Read {len(human_items)} unique human-overlap texts from {args.human_dir}")
+    print(f"Read {len(human_items)} unique human-overlap items from {args.human_dir}")
     print(f"Compared {len(predictions_by_model)} judge models from {args.judge_dir}")
     print(f"Wrote {args.output}")
-
-
-if __name__ == "__main__":
-    main()

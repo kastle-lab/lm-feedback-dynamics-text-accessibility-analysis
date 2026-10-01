@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-"""Simple Ollama LLM-as-judge runner for result CSV rows."""
+# Ollama LLM-as-judge runner for result CSV rows
 
 import argparse
 import csv
@@ -238,8 +237,6 @@ def main():
     print(f"Wrote judgments to {output_jsonl}")
     print(f"Wrote tracker to {tracker_csv}")
 
-
-if __name__ == "__main__":
-    if Path.cwd().name != "AIED 2026":
-        print("Tip: run this from the AIED 2026 directory.", file=sys.stderr)
-    main()
+if Path.cwd().name != "AIED 2026":
+    print("Tip: run this from the AIED 2026 directory.", file=sys.stderr)
+main()

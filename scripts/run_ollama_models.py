@@ -175,7 +175,3 @@ def main():
 
     summarize(results_dir)
     print(f"Wrote summary: {results_dir / 'summary.csv'}")
-
-
-if __name__ == "__main__":
-    main()
